@@ -3,8 +3,8 @@
 // @namespace    local.chatgpt.subscription.toolbox
 // @version      1.0.1
 // @description  整合 ChatGPT Team 與 Plus 的結帳連結工具。
-// @downloadURL  https://your-domain.example/path/to/index.user.js
-// @updateURL    https://your-domain.example/path/to/index.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
+// @updateURL    https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // ==/UserScript==
