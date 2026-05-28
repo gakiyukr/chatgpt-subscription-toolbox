@@ -1,0 +1,433 @@
+// ==UserScript==
+// @name         ChatGPT Plus Checkout Link Generator
+// @namespace    local.chatgpt.checkout.link
+// @version      1.2.0
+// @description  Generate ChatGPT Plus checkout link only. Region: US.
+// @downloadURL   http://127.0.0.1:8765/ChatGPT-Plus-Checkout-Link-Generator.user.js
+// @updateURL     http://127.0.0.1:8765/ChatGPT-Plus-Checkout-Link-Generator.user.js
+// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/*
+// @grant        GM_addStyle
+// @run-at       document-start
+// @noframes
+// ==/UserScript==
+
+(function checkoutLinkGenerator() {
+  "use strict";
+
+  const CHECKOUT_ENDPOINT = "https://chatgpt.com/backend-api/payments/checkout";
+  const PRICING_URL = "https://chatgpt.com/#pricing";
+  const BUTTON_ID = "gpt-checkout-link-generator-button";
+  const MODAL_OVERLAY_CLASS = "gpt-checkout-link-modal-overlay";
+
+  function runWhenBodyReady(task) {
+    if (document.body) {
+      task();
+      return;
+    }
+
+    document.addEventListener("DOMContentLoaded", task, { once: true });
+  }
+
+  function installStyles() {
+    const css = `
+      #${BUTTON_ID} {
+        position: fixed;
+        top: 50%;
+        left: 20px;
+        transform: translateY(-50%);
+        z-index: 2147483646;
+        background: #10a37f;
+        color: #fff;
+        border: 0;
+        padding: 10px 20px;
+        border-radius: 8px;
+        font: 700 14px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        transition: background 0.2s, transform 0.1s, opacity 0.2s;
+      }
+
+      #${BUTTON_ID}:hover {
+        background: #0e8c6b;
+        transform: translateY(-50%) scale(1.03);
+      }
+
+      #${BUTTON_ID}:active {
+        transform: translateY(-50%) scale(0.98);
+      }
+
+      #${BUTTON_ID}:disabled {
+        cursor: not-allowed;
+        opacity: 0.72;
+      }
+
+      .${MODAL_OVERLAY_CLASS} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.68);
+      }
+
+      .gpt-checkout-link-modal {
+        position: relative;
+        width: min(92vw, 520px);
+        padding: 24px;
+        border-radius: 14px;
+        background: #1f2937;
+        color: #e5e7eb;
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+        font: 14px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .gpt-checkout-link-title {
+        margin: 0 36px 14px 0;
+        color: #34d399;
+        font-size: 18px;
+        line-height: 1.35;
+      }
+
+      .gpt-checkout-link-title.error {
+        color: #f87171;
+      }
+
+      .gpt-checkout-link-close {
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        width: 30px;
+        height: 30px;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: #cbd5e1;
+        cursor: pointer;
+        font-size: 20px;
+      }
+
+      .gpt-checkout-link-content {
+        display: grid;
+        gap: 12px;
+      }
+
+      .gpt-checkout-link-url {
+        display: block;
+        color: #34d399;
+        word-break: break-all;
+        text-decoration: none;
+      }
+
+      .gpt-checkout-link-url:hover {
+        text-decoration: underline;
+      }
+
+      .gpt-checkout-link-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .gpt-checkout-link-open,
+      .gpt-checkout-link-copy {
+        width: fit-content;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 14px;
+        background: #10a37f;
+        color: #fff;
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      .gpt-checkout-link-copy {
+        background: #2563eb;
+      }
+
+      .gpt-checkout-link-open:hover {
+        background: #0e8c6b;
+      }
+
+      .gpt-checkout-link-copy:hover {
+        background: #1d4ed8;
+      }
+
+      .gpt-checkout-link-note {
+        margin: 0;
+        color: #cbd5e1;
+        font-size: 12px;
+      }
+
+      .gpt-checkout-link-error {
+        margin: 0;
+        max-height: 240px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border-radius: 8px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #fecaca;
+      }
+    `;
+
+    if (typeof GM_addStyle === "function") {
+      GM_addStyle(css);
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.textContent = css;
+    document.documentElement.appendChild(style);
+  }
+
+  function removeExistingModal() {
+    document.querySelector(`.${MODAL_OVERLAY_CLASS}`)?.remove();
+  }
+
+  function createText(tagName, text, className) {
+    const element = document.createElement(tagName);
+    if (className) element.className = className;
+    element.textContent = text;
+    return element;
+  }
+
+  function isHttpUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" || url.protocol === "http:";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function copyToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.setAttribute("readonly", "");
+    textArea.style.cssText = "position:fixed;left:-9999px;top:-9999px;opacity:0;";
+    document.body.appendChild(textArea);
+    textArea.select();
+
+    try {
+      if (!document.execCommand("copy")) {
+        throw new Error("document.execCommand copy failed");
+      }
+    } finally {
+      textArea.remove();
+    }
+  }
+
+  function showModal(options) {
+    removeExistingModal();
+
+    const overlay = document.createElement("div");
+    overlay.className = MODAL_OVERLAY_CLASS;
+
+    const modal = document.createElement("div");
+    modal.className = "gpt-checkout-link-modal";
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "gpt-checkout-link-close";
+    closeButton.textContent = "x";
+    closeButton.addEventListener("click", () => overlay.remove());
+
+    const titleClass = `gpt-checkout-link-title${options.isError ? " error" : ""}`;
+    const title = createText("h3", options.title, titleClass);
+    const content = document.createElement("div");
+    content.className = "gpt-checkout-link-content";
+
+    if (options.message) {
+      content.appendChild(createText("p", options.message, "gpt-checkout-link-note"));
+    }
+
+    if (options.linkUrl) {
+      const link = document.createElement("a");
+      link.className = "gpt-checkout-link-url";
+      link.href = options.linkUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = options.linkUrl;
+      content.appendChild(link);
+
+      const actions = document.createElement("div");
+      actions.className = "gpt-checkout-link-actions";
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "gpt-checkout-link-open";
+      openButton.textContent = "打开支付页面";
+      openButton.addEventListener("click", () => {
+        window.open(options.linkUrl, "_blank", "noopener,noreferrer");
+      });
+      actions.appendChild(openButton);
+
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "gpt-checkout-link-copy";
+      copyButton.textContent = "复制链接";
+      copyButton.addEventListener("click", async () => {
+        const originalText = copyButton.textContent;
+
+        try {
+          await copyToClipboard(options.linkUrl);
+          copyButton.textContent = "已复制";
+        } catch (error) {
+          console.error("复制支付链接失败：", error);
+          copyButton.textContent = "复制失败";
+        }
+
+        setTimeout(() => {
+          copyButton.textContent = originalText;
+        }, 1600);
+      });
+      actions.appendChild(copyButton);
+
+      content.appendChild(actions);
+    }
+
+    if (options.errorDetail) {
+      content.appendChild(createText("pre", options.errorDetail, "gpt-checkout-link-error"));
+    }
+
+    if (options.isError) {
+      content.appendChild(createText(
+        "p",
+        "请检查网络、登录状态或接口返回内容后重试。",
+        "gpt-checkout-link-note",
+      ));
+    }
+
+    modal.appendChild(closeButton);
+    modal.appendChild(title);
+    modal.appendChild(content);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) overlay.remove();
+    });
+  }
+
+  async function parseJsonResponse(response, label) {
+    const rawText = await response.text();
+    let data = null;
+
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch (_) {
+        const preview = rawText.length > 500 ? `${rawText.slice(0, 500)}...` : rawText;
+        throw new Error(`${label} 返回的不是有效 JSON。HTTP ${response.status} ${response.statusText}\n${preview}`);
+      }
+    }
+
+    if (!response.ok) {
+      const detail = data && (data.detail || data.error || data.message);
+      throw new Error(`${label} 请求失败。HTTP ${response.status} ${response.statusText}${detail ? `\n${detail}` : ""}`);
+    }
+
+    return data || {};
+  }
+
+  function buildCheckoutPayload() {
+    return {
+      plan_name: "chatgptplusplan",
+      billing_details: {
+        country: "US",
+        currency: "USD",
+      },
+      cancel_url: PRICING_URL,
+      promo_campaign: {
+        promo_campaign_id: "plus-1-month-free",
+        is_coupon_from_query_param: false,
+      },
+      checkout_ui_mode: "hosted",
+    };
+  }
+
+  async function getSession() {
+    const sessionResponse = await fetch("/api/auth/session", { credentials: "include" });
+    const session = await parseJsonResponse(sessionResponse, "登录信息");
+
+    if (!session.accessToken) {
+      throw new Error("accessToken 缺失，请重新登录 ChatGPT。");
+    }
+
+    return session;
+  }
+
+  async function createCheckoutLink(accessToken) {
+    const checkoutResponse = await fetch(CHECKOUT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildCheckoutPayload()),
+    });
+
+    const data = await parseJsonResponse(checkoutResponse, "支付链接");
+
+    if (!data.url || !isHttpUrl(data.url)) {
+      throw new Error(`支付接口没有返回有效链接。\n${JSON.stringify(data, null, 2)}`);
+    }
+
+    return data.url;
+  }
+
+  function createButton() {
+    if (document.getElementById(BUTTON_ID)) return;
+
+    const button = document.createElement("button");
+    button.id = BUTTON_ID;
+    button.type = "button";
+    button.textContent = "生成 Plus 支付链接";
+
+    button.addEventListener("click", async () => {
+      button.textContent = "请求中...";
+      button.disabled = true;
+
+      try {
+        const session = await getSession();
+        const checkoutUrl = await createCheckoutLink(session.accessToken);
+
+        showModal({
+          title: "支付链接已生成",
+          message: "链接已生成，请手动打开支付页面。",
+          linkUrl: checkoutUrl,
+          isError: false,
+        });
+
+        console.log("成功生成支付长链接：", checkoutUrl);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("生成支付链接出错：", error);
+
+        showModal({
+          title: "生成支付链接失败",
+          errorDetail: message,
+          isError: true,
+        });
+      } finally {
+        button.textContent = "生成 Plus 支付链接";
+        button.disabled = false;
+      }
+    });
+
+    document.body.appendChild(button);
+  }
+
+  runWhenBodyReady(() => {
+    installStyles();
+    createButton();
+  });
+})();
