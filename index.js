@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 訂閱工具箱
 // @namespace    local.chatgpt.subscription.toolbox
-// @version      1.0.1
-// @description  整合 ChatGPT Team 與 Plus 的結帳連結工具。
+// @version      1.1.0
+// @description  整合 ChatGPT Team、Plus 與 Codex 的結帳連結工具。
 // @downloadURL  https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @updateURL    https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @match        https://chatgpt.com/*
@@ -13,16 +13,24 @@
   "use strict";
 
   const CHECKOUT_ENDPOINT = "https://chatgpt.com/backend-api/payments/checkout";
+  const CODEX_UPDATE_ENDPOINT = "https://chatgpt.com/backend-api/payments/checkout/update";
   const SESSION_ENDPOINT = "/api/auth/session";
   const TEAM_CANCEL_URL = "https://chatgpt.com/";
   const PLUS_CANCEL_URL = "https://chatgpt.com/#pricing";
   const FALLBACK_CHECKOUT_BASE = "https://chatgpt.com/checkout/openai_llc/";
+
+  // Codex Team 的結帳工作階段在那條 ?kind=codex_team 長鏈接內已存在，
+  // 必須改打 update 端點調整方案數量，才會取得可用的付款連結。
+  const CODEX_PROCESSOR_ENTITY = "openai_llc";
+  const CODEX_KIND = "codex_team";
+  const CODEX_DEFAULT_QUANTITY = 13;
 
   const DOM_IDS = {
     fab: "subscription-toolbox-fab",
     panel: "subscription-toolbox-panel",
     tabTeam: "subscription-toolbox-tab-team",
     tabPlus: "subscription-toolbox-tab-plus",
+    tabCodex: "subscription-toolbox-tab-codex",
     panelBody: "subscription-toolbox-panel-body",
     result: "subscription-toolbox-result",
   };
@@ -117,6 +125,10 @@
       country: "US",
       currency: "USD",
       promoCode: "",
+    },
+    codexForm: {
+      checkoutLink: "",
+      quantity: CODEX_DEFAULT_QUANTITY,
     },
   };
 
@@ -251,6 +263,60 @@
     return null;
   }
 
+  // 從 Codex Team 長鏈接或裸 ID 取出 checkout_session_id。
+  // 支援完整網址（含 ?kind=codex_team 等查詢參數）與直接貼上的 ID。
+  function extractCheckoutSessionId(input) {
+    const raw = (input || "").trim();
+    if (!raw) return "";
+
+    let candidate = raw;
+    if (isHttpUrl(raw)) {
+      try {
+        const url = new URL(raw);
+        const fromQuery =
+          url.searchParams.get("checkout_session_id") ||
+          url.searchParams.get("checkoutSessionId");
+        const segments = url.pathname.split("/").filter(Boolean);
+        const fromPath = segments.length ? segments[segments.length - 1] : "";
+        candidate = fromQuery || fromPath || "";
+      } catch (_) {
+        candidate = "";
+      }
+    }
+
+    // 入口網址可能停在 /checkout 等佔位字段，並非真正的 session id。
+    const placeholders = new Set(["checkout", "team", "codex", "openai_llc"]);
+    if (!candidate || placeholders.has(candidate)) return "";
+    return candidate;
+  }
+
+  // 將數量規整為大於等於 1 的整數，無法解析時退回預設值。
+  function normalizeCodexQuantity(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      return CODEX_DEFAULT_QUANTITY;
+    }
+    return parsed;
+  }
+
+  function buildCodexUpdatePayload(checkoutSessionId, quantity) {
+    return {
+      checkout_session_id: checkoutSessionId,
+      processor_entity: CODEX_PROCESSOR_ENTITY,
+      credit_purchase_quantity: normalizeCodexQuantity(quantity),
+    };
+  }
+
+  // update 端點未必回傳付款連結，必要時依 session id 組回 Codex Team 結帳頁。
+  function buildCodexCheckoutLink(data, checkoutSessionId) {
+    const direct = extractCheckoutLink(data);
+    if (isHttpUrl(direct)) return direct;
+    if (checkoutSessionId) {
+      return `${FALLBACK_CHECKOUT_BASE}${checkoutSessionId}?kind=${CODEX_KIND}`;
+    }
+    return null;
+  }
+
   function shouldClosePanelOnDocumentClick({ isOpen, event, panel, fab }) {
     if (!isOpen || !panel || !fab || !event) return false;
 
@@ -310,6 +376,31 @@
     });
 
     return parseJsonResponse(response, "Checkout");
+  }
+
+  // Codex Team 走 update 端點，需附帶與瀏覽器一致的裝置與語系標頭。
+  async function postCodexUpdate(accessToken, payload) {
+    const response = await fetch(CODEX_UPDATE_ENDPOINT, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "oai-device-id": getDeviceId(),
+        "oai-language": "zh-CN",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    return parseJsonResponse(response, "Codex Checkout");
+  }
+
+  function getDeviceId() {
+    try {
+      return globalScope.localStorage?.getItem("oai-device-id") || "";
+    } catch (_) {
+      return "";
+    }
   }
 
   async function copyToClipboard(text) {
@@ -434,7 +525,7 @@
 
       .subscription-toolbox-tabs {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr;
         gap: 8px;
       }
 
@@ -807,6 +898,36 @@
     }
   }
 
+  async function handleCodexSubmit() {
+    clearResult();
+
+    const checkoutSessionId = extractCheckoutSessionId(state.codexForm.checkoutLink);
+    if (!checkoutSessionId) {
+      setResult({ error: "請貼上含 checkout_session_id 的 Codex Team 結帳長連結。" });
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const session = await getSession();
+      const payload = buildCodexUpdatePayload(checkoutSessionId, state.codexForm.quantity);
+      const data = await postCodexUpdate(session.accessToken, payload);
+      const link = buildCodexCheckoutLink(data, checkoutSessionId);
+
+      if (!isHttpUrl(link)) {
+        throw new Error(`結帳介面沒有回傳可用的連結。\n${JSON.stringify(data, null, 2)}`);
+      }
+
+      setResult({ link });
+    } catch (error) {
+      console.error("Codex 結帳連結產生失敗", error);
+      setResult({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function renderTeamTabContent(container) {
     const card = createElement("div", "subscription-toolbox-card");
     const grid = createElement("div", "subscription-toolbox-grid");
@@ -918,6 +1039,52 @@
     container.appendChild(card);
   }
 
+  function renderCodexTabContent(container) {
+    const card = createElement("div", "subscription-toolbox-card");
+    const grid = createElement("div", "subscription-toolbox-grid");
+
+    const linkField = createElement("div", "subscription-toolbox-field");
+    const linkLabel = createElement("label", "", "Codex Team 結帳長連結");
+    const linkInput = document.createElement("input");
+    linkInput.type = "text";
+    linkInput.value = state.codexForm.checkoutLink;
+    linkInput.placeholder = "https://chatgpt.com/checkout/openai_llc/...?kind=codex_team";
+    linkInput.addEventListener("input", (event) => {
+      state.codexForm.checkoutLink = event.target.value;
+    });
+    linkField.appendChild(linkLabel);
+    linkField.appendChild(linkInput);
+
+    const quantityField = createElement("div", "subscription-toolbox-field");
+    const quantityLabel = createElement("label", "", "點數方案數量");
+    const quantityInput = document.createElement("input");
+    quantityInput.type = "number";
+    quantityInput.min = "1";
+    quantityInput.value = String(state.codexForm.quantity);
+    quantityInput.addEventListener("input", (event) => {
+      state.codexForm.quantity = event.target.value;
+    });
+    quantityField.appendChild(quantityLabel);
+    quantityField.appendChild(quantityInput);
+
+    const actions = createElement("div", "subscription-toolbox-actions");
+    const button = createElement(
+      "button",
+      "subscription-toolbox-primary",
+      state.loading ? "產生 Codex 連結中..." : "產生 Codex 結帳連結",
+    );
+    button.type = "button";
+    button.disabled = state.loading;
+    button.addEventListener("click", handleCodexSubmit);
+    actions.appendChild(button);
+
+    grid.appendChild(linkField);
+    grid.appendChild(quantityField);
+    grid.appendChild(actions);
+    card.appendChild(grid);
+    container.appendChild(card);
+  }
+
   function renderBody() {
     const body = document.getElementById(DOM_IDS.panelBody);
     if (!body) return;
@@ -949,15 +1116,30 @@
       renderBody();
     });
 
+    const codexTab = createElement(
+      "button",
+      `subscription-toolbox-tab${state.activeTab === "codex" ? " is-active" : ""}`,
+      "Codex",
+    );
+    codexTab.id = DOM_IDS.tabCodex;
+    codexTab.type = "button";
+    codexTab.addEventListener("click", () => {
+      state.activeTab = "codex";
+      renderBody();
+    });
+
     tabs.appendChild(teamTab);
     tabs.appendChild(plusTab);
+    tabs.appendChild(codexTab);
     body.appendChild(tabs);
 
     const content = createElement("div", "subscription-toolbox-content");
     if (state.activeTab === "team") {
       renderTeamTabContent(content);
-    } else {
+    } else if (state.activeTab === "plus") {
       renderPlusTabContent(content);
+    } else {
+      renderCodexTabContent(content);
     }
     body.appendChild(content);
 
@@ -981,7 +1163,7 @@
       createElement(
         "p",
         "subscription-toolbox-subtitle",
-        "用同一個面板管理 Team 與 Plus 的結帳連結。",
+        "用同一個面板管理 Team、Plus 與 Codex 的結帳連結。",
       ),
     );
 
@@ -1141,10 +1323,13 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
+      buildCodexUpdatePayload,
+      buildCodexCheckoutLink,
       buildPlusPayload,
       buildTeamPayload,
       clampFabPosition,
       extractCheckoutLink,
+      extractCheckoutSessionId,
       getCountryDefaultCurrency,
       getCountryOptionLabel,
       getDisplayLinkText,
@@ -1152,6 +1337,7 @@
       getPlusSummaryLines,
       getSuccessMessage,
       hasFabDragExceededThreshold,
+      normalizeCodexQuantity,
       shouldClosePanelOnDocumentClick,
     };
   }

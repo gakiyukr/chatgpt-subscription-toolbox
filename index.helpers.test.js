@@ -2,10 +2,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  buildCodexUpdatePayload,
+  buildCodexCheckoutLink,
   buildTeamPayload,
   buildPlusPayload,
   clampFabPosition,
   extractCheckoutLink,
+  extractCheckoutSessionId,
   getCountryDefaultCurrency,
   getCountryOptionLabel,
   getPanelLayoutMode,
@@ -13,6 +16,7 @@ const {
   getPlusSummaryLines,
   hasFabDragExceededThreshold,
   getSuccessMessage,
+  normalizeCodexQuantity,
   shouldClosePanelOnDocumentClick,
 } = require("./index.js");
 
@@ -190,4 +194,61 @@ test("panel layout mode uses a scroll-friendly flex column structure", () => {
     bodyMinHeight: 0,
     bodyOverflowY: "auto",
   });
+});
+
+test("extractCheckoutSessionId reads the id from a codex_team long link", () => {
+  assert.equal(
+    extractCheckoutSessionId(
+      "https://chatgpt.com/checkout/openai_llc/cs_live_abc123?kind=codex_team",
+    ),
+    "cs_live_abc123",
+  );
+});
+
+test("extractCheckoutSessionId prefers an explicit query parameter", () => {
+  assert.equal(
+    extractCheckoutSessionId(
+      "https://chatgpt.com/codex/team/checkout?checkout_session_id=cs_query_999",
+    ),
+    "cs_query_999",
+  );
+});
+
+test("extractCheckoutSessionId accepts a bare id and rejects placeholders", () => {
+  assert.equal(extractCheckoutSessionId("cs_bare_001"), "cs_bare_001");
+  assert.equal(extractCheckoutSessionId("https://chatgpt.com/codex/team/checkout"), "");
+  assert.equal(extractCheckoutSessionId(""), "");
+});
+
+test("normalizeCodexQuantity falls back to the default for invalid input", () => {
+  assert.equal(normalizeCodexQuantity("13"), 13);
+  assert.equal(normalizeCodexQuantity(7), 7);
+  assert.equal(normalizeCodexQuantity("abc"), 13);
+  assert.equal(normalizeCodexQuantity(0), 13);
+  assert.equal(normalizeCodexQuantity(-5), 13);
+});
+
+test("buildCodexUpdatePayload pins the processor entity and normalizes quantity", () => {
+  assert.deepEqual(buildCodexUpdatePayload("cs_test_42", "abc"), {
+    checkout_session_id: "cs_test_42",
+    processor_entity: "openai_llc",
+    credit_purchase_quantity: 13,
+  });
+  assert.deepEqual(buildCodexUpdatePayload("cs_test_42", 5), {
+    checkout_session_id: "cs_test_42",
+    processor_entity: "openai_llc",
+    credit_purchase_quantity: 5,
+  });
+});
+
+test("buildCodexCheckoutLink prefers a direct link, else rebuilds from session id", () => {
+  assert.equal(
+    buildCodexCheckoutLink({ url: "https://pay.stripe.com/session" }, "cs_x"),
+    "https://pay.stripe.com/session",
+  );
+  assert.equal(
+    buildCodexCheckoutLink({}, "cs_rebuild_1"),
+    "https://chatgpt.com/checkout/openai_llc/cs_rebuild_1?kind=codex_team",
+  );
+  assert.equal(buildCodexCheckoutLink({}, ""), null);
 });

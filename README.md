@@ -1,15 +1,16 @@
 # ChatGPT Subscription Toolbox
 
-一個以 Tampermonkey 為基礎的 ChatGPT 訂閱工具集合，用來在已登入的 ChatGPT 網頁中產生 **ChatGPT Team** 與 **ChatGPT Plus** 的結帳連結。
+一個以 Tampermonkey 為基礎的 ChatGPT 訂閱工具集合，用來在已登入的 ChatGPT 網頁中產生 **ChatGPT Team**、**ChatGPT Plus** 與 **ChatGPT Codex Team** 的結帳連結。
 
 ## 功能簡介
 
 `index.js` 是目前的主要入口，提供：
 
 - 單一懸浮按鈕開啟工具面板
-- `Team` / `Plus` 雙分頁切換
+- `Team` / `Plus` / `Codex` 三分頁切換
 - Team 方案可選國家、幣別、團隊名稱與優惠碼
 - Plus 方案保留固定流程
+- Codex 方案貼上 `?kind=codex_team` 結帳長連結並調整點數方案數量，透過 update 端點取得付款連結
 - 產生結帳連結後可手動開啟或複製
 - 懸浮按鈕可拖曳
 - 面板支援長內容捲動
@@ -28,6 +29,7 @@
 3. 依需求切換：
    - `Team`：填入團隊名稱、國家 / 地區、幣別與優惠碼
    - `Plus`：使用目前固定流程
+   - `Codex`：貼上 `?kind=codex_team` 結帳長連結並設定點數方案數量
 4. 點擊產生結帳連結
 5. 在結果區中手動開啟或複製連結
 

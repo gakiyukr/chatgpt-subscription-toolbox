@@ -1,0 +1,49 @@
+(async () => {
+  try {
+    // 1. 获取 accessToken
+    const sessionRes = await fetch("/api/auth/session", { credentials: "include" });
+    if (!sessionRes.ok) {
+      throw new Error(`获取 session 失败 (HTTP ${sessionRes.status})`);
+    }
+    const sessionData = await sessionRes.json();
+    const accessToken = sessionData?.accessToken;
+    if (!accessToken) {
+      throw new Error("未找到 accessToken，请确认已登录");
+    }
+
+    // 2. 从 URL 获取 checkout_session_id
+    const checkoutSessionId = window.location.pathname.split("/").pop().split("?")[0];
+
+    // 3. 发起 update 请求
+    const res = await fetch("https://chatgpt.com/backend-api/payments/checkout/update", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "oai-device-id": localStorage.getItem("oai-device-id") || "",
+        "oai-language": "zh-CN",
+        Referer: window.location.href
+      },
+      body: JSON.stringify({
+        checkout_session_id: checkoutSessionId,
+        processor_entity: "openai_llc",
+        credit_purchase_quantity: 13
+      })
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`请求失败 (HTTP ${res.status}): ${text.slice(0, 120)}`);
+    }
+
+    const data = await res.json();
+    console.log("成功:", data);
+
+    // 4. 执行完成，刷新页面
+    window.location.reload();
+
+  } catch (err) {
+    console.error("失败:", err.message);
+  }
+})();
