@@ -129,6 +129,7 @@
     codexForm: {
       checkoutLink: "",
       quantity: CODEX_DEFAULT_QUANTITY,
+      workspaceName: "work",
     },
   };
 
@@ -304,6 +305,26 @@
       checkout_session_id: checkoutSessionId,
       processor_entity: CODEX_PROCESSOR_ENTITY,
       credit_purchase_quantity: normalizeCodexQuantity(quantity),
+    };
+  }
+
+  // Codex 直連結帳：直接打 /checkout 端點，不需事先取得 checkout_session_id。
+  function buildCodexDirectPayload(input) {
+    const workspaceName = (input.workspaceName || "work").trim() || "work";
+    return {
+      plan_name: "chatgptbusiness_usage_based",
+      entry_point: "team_workspace_purchase_modal",
+      checkout_ui_mode: "hosted",
+      billing_details: {
+        country: "US",
+        currency: "USD",
+      },
+      usage_based_workspace_credit_purchase_data: {
+        workspace_name: workspaceName,
+        quantity: normalizeCodexQuantity(input.quantity),
+        unit: "credit",
+      },
+      cancel_url: PLUS_CANCEL_URL,
     };
   }
 
@@ -928,6 +949,29 @@
     }
   }
 
+  async function handleCodexDirectSubmit() {
+    clearResult();
+    setLoading(true);
+
+    try {
+      const session = await getSession();
+      const payload = buildCodexDirectPayload(state.codexForm);
+      const data = await postCheckout(session.accessToken, payload);
+      const link = extractCheckoutLink(data);
+
+      if (!isHttpUrl(link)) {
+        throw new Error(`結帳介面沒有回傳可用的連結。\n${JSON.stringify(data, null, 2)}`);
+      }
+
+      setResult({ link });
+    } catch (error) {
+      console.error("Codex 直接結帳連結產生失敗", error);
+      setResult({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function renderTeamTabContent(container) {
     const card = createElement("div", "subscription-toolbox-card");
     const grid = createElement("div", "subscription-toolbox-grid");
@@ -1040,20 +1084,27 @@
   }
 
   function renderCodexTabContent(container) {
-    const card = createElement("div", "subscription-toolbox-card");
-    const grid = createElement("div", "subscription-toolbox-grid");
+    // 一鍵直連結帳區塊
+    const directCard = createElement("div", "subscription-toolbox-card");
+    const directGrid = createElement("div", "subscription-toolbox-grid");
 
-    const linkField = createElement("div", "subscription-toolbox-field");
-    const linkLabel = createElement("label", "", "Codex Team 結帳長連結");
-    const linkInput = document.createElement("input");
-    linkInput.type = "text";
-    linkInput.value = state.codexForm.checkoutLink;
-    linkInput.placeholder = "https://chatgpt.com/checkout/openai_llc/...?kind=codex_team";
-    linkInput.addEventListener("input", (event) => {
-      state.codexForm.checkoutLink = event.target.value;
+    const directTitle = createElement("div", "subscription-toolbox-field");
+    directTitle.innerHTML = '<label style="font-weight:700;color:#0f766e;">一鍵取得 Codex 付款連結</label>';
+    directGrid.appendChild(directTitle);
+
+    const workspaceRow = createElement("div", "subscription-toolbox-grid two-cols");
+
+    const workspaceField = createElement("div", "subscription-toolbox-field");
+    const workspaceLabel = createElement("label", "", "Workspace 名稱");
+    const workspaceInput = document.createElement("input");
+    workspaceInput.type = "text";
+    workspaceInput.value = state.codexForm.workspaceName;
+    workspaceInput.placeholder = "work";
+    workspaceInput.addEventListener("input", (event) => {
+      state.codexForm.workspaceName = event.target.value;
     });
-    linkField.appendChild(linkLabel);
-    linkField.appendChild(linkInput);
+    workspaceField.appendChild(workspaceLabel);
+    workspaceField.appendChild(workspaceInput);
 
     const quantityField = createElement("div", "subscription-toolbox-field");
     const quantityLabel = createElement("label", "", "點數方案數量");
@@ -1067,22 +1118,24 @@
     quantityField.appendChild(quantityLabel);
     quantityField.appendChild(quantityInput);
 
-    const actions = createElement("div", "subscription-toolbox-actions");
-    const button = createElement(
+    workspaceRow.appendChild(workspaceField);
+    workspaceRow.appendChild(quantityField);
+    directGrid.appendChild(workspaceRow);
+
+    const directActions = createElement("div", "subscription-toolbox-actions");
+    const directButton = createElement(
       "button",
       "subscription-toolbox-primary",
-      state.loading ? "產生 Codex 連結中..." : "產生 Codex 結帳連結",
+      state.loading ? "產生 Codex 連結中..." : "一鍵取得 Codex 付款連結",
     );
-    button.type = "button";
-    button.disabled = state.loading;
-    button.addEventListener("click", handleCodexSubmit);
-    actions.appendChild(button);
+    directButton.type = "button";
+    directButton.disabled = state.loading;
+    directButton.addEventListener("click", handleCodexDirectSubmit);
+    directActions.appendChild(directButton);
+    directGrid.appendChild(directActions);
 
-    grid.appendChild(linkField);
-    grid.appendChild(quantityField);
-    grid.appendChild(actions);
-    card.appendChild(grid);
-    container.appendChild(card);
+    directCard.appendChild(directGrid);
+    container.appendChild(directCard);
   }
 
   function renderBody() {
@@ -1323,6 +1376,7 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
+      buildCodexDirectPayload,
       buildCodexUpdatePayload,
       buildCodexCheckoutLink,
       buildPlusPayload,
