@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 訂閱工具箱
 // @namespace    local.chatgpt.subscription.toolbox
-// @version      1.1.0
-// @description  整合 ChatGPT Team、Plus 與 Codex 的結帳連結工具。
+// @version      1.2.0
+// @description  整合 ChatGPT Team、Plus 與 Codex 的結帳連結與席位費用查詢工具。
 // @downloadURL  https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @updateURL    https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @match        https://chatgpt.com/*
@@ -25,12 +25,27 @@
   const CODEX_KIND = "codex_team";
   const CODEX_DEFAULT_QUANTITY = 13;
 
+  // 席位費用查詢常數（遷移自 DevTools 控制台腳本）。
+  const AUTH_CLAIM = "https://api.openai.com/auth";
+  const SEAT_PREVIEW_START_SEATS = 3;
+  const SEAT_PREVIEW_MAX_ATTEMPTS = 3;
+
+  const ZERO_DECIMAL_CURRENCIES = new Set([
+    "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA",
+    "PYG", "RWF", "VND", "VUV", "XAF", "XOF", "XPF",
+  ]);
+  const THREE_DECIMAL_CURRENCIES = new Set([
+    "BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND",
+  ]);
+  const FOUR_DECIMAL_CURRENCIES = new Set(["CLF", "UYW"]);
+
   const DOM_IDS = {
     fab: "subscription-toolbox-fab",
     panel: "subscription-toolbox-panel",
     tabTeam: "subscription-toolbox-tab-team",
     tabPlus: "subscription-toolbox-tab-plus",
     tabCodex: "subscription-toolbox-tab-codex",
+    tabSeat: "subscription-toolbox-tab-seat",
     panelBody: "subscription-toolbox-panel-body",
     result: "subscription-toolbox-result",
   };
@@ -120,6 +135,8 @@
     loading: false,
     lastLink: "",
     lastError: "",
+    lastTitle: "",
+    lastRows: [],
     teamForm: {
       teamName: "MyTeam",
       country: "US",
@@ -130,6 +147,12 @@
       checkoutLink: "",
       quantity: CODEX_DEFAULT_QUANTITY,
       workspaceName: "work",
+    },
+    seatForm: {
+      workspaces: [],
+      loadState: "idle",
+      loadError: "",
+      selectedId: "",
     },
   };
 
@@ -377,6 +400,43 @@
     return data;
   }
 
+  // 席位查詢的回應解析：預覽端點對錯誤結構更敏感，統一在此萃取錯誤訊息。
+  async function requestJson(url, options = {}, label = "請求") {
+    const response = await fetch(url, {
+      credentials: "include",
+      cache: "no-store",
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    const text = await response.text();
+    let data = {};
+    if (text.trim()) {
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = {};
+      }
+    }
+    if (!response.ok) {
+      const error = data?.error && typeof data.error === "object" ? data.error : {};
+      const detail = firstText(
+        error.message,
+        error.code,
+        data?.message,
+        data?.detail,
+        text.slice(0, 240),
+      );
+      throw new Error(`${label}失敗：HTTP ${response.status}${detail ? ` · ${detail}` : ""}`);
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error(`${label}失敗：回應不是 JSON 物件`);
+    }
+    return data;
+  }
+
   async function getSession() {
     const response = await fetch(SESSION_ENDPOINT, { credentials: "include" });
     const session = await parseJsonResponse(response, "Session");
@@ -384,6 +444,106 @@
       throw new Error("缺少 accessToken，請重新登入 ChatGPT。");
     }
     return session;
+  }
+
+  // 讀取登入會話（沿用控制台腳本行為：寬鬆解析、缺 token 時給出明確錯誤）。
+  async function fetchSeatInitialSession() {
+    const session = await requestJson("/api/auth/session", {}, "讀取登入會話");
+    const context = authContext(session);
+    if (!context.accessToken) throw new Error("目前頁面沒有有效的登入會話");
+    return { session, context };
+  }
+
+  async function fetchWorkspaceAccounts(accessToken) {
+    return requestJson(
+      "/backend-api/accounts/check/v4-2023-04-27",
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      "讀取 Workspace 列表",
+    );
+  }
+
+  // 以 workspace 為作用域交換出一個新的 session（透過 _account 等 context cookies）。
+  async function workspaceSession(workspaceId, initialSession) {
+    const initial = authContext(initialSession);
+    if (initial.accountId === workspaceId && initial.accessToken) return initial;
+
+    const query = new URLSearchParams({
+      exchange_workspace_token: "true",
+      workspace_id: workspaceId,
+      reason: "setCurrentAccount",
+    });
+    const contextCookies = [
+      ["_account", workspaceId],
+      ["_account_is_fedramp", "false"],
+      ["_account_residency_region", "no_constraint"],
+    ];
+    const previousCookies = new Map(
+      contextCookies.map(([name]) => [name, document.cookie]),
+    );
+    let session;
+    try {
+      for (const [name, value] of contextCookies) {
+        document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; Secure; SameSite=Lax`;
+      }
+      session = await requestJson(
+        `/api/auth/session?${query}`,
+        {
+          headers: {
+            "X-OpenAI-Target-Path": "/api/auth/session",
+            "X-OpenAI-Target-Route": "/api/auth/session",
+          },
+        },
+        "切換 Workspace 上下文",
+      );
+    } finally {
+      // 還原使用者原本的帳號上下文 cookies，避免影響當前頁面登入狀態。
+      for (const [name] of contextCookies) {
+        const previous = previousCookies.get(name);
+        if (previous) document.cookie = previous;
+        else {
+          document.cookie = `${name}=; Path=/; Max-Age=0; Secure; SameSite=Lax`;
+        }
+      }
+    }
+    const context = authContext(session);
+    if (!context.accessToken) throw new Error("Workspace 會話未回傳 Access Token");
+    if (context.accountId && context.accountId !== workspaceId) {
+      throw new Error(`Workspace 切換結果不匹配：${context.accountId}`);
+    }
+    return { ...context, accountId: workspaceId };
+  }
+
+  // 只讀的席位費用預覽，不會真的更新訂閱。
+  async function previewSeatCost(accessToken, workspaceId, updatedSeats) {
+    const query = new URLSearchParams({
+      account_id: workspaceId,
+      updated_seats: String(updatedSeats),
+    });
+    return requestJson(
+      `/backend-api/subscriptions/update/preview?${query}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "chatgpt-account-id": workspaceId,
+        },
+      },
+      "讀取席位費用",
+    );
+  }
+
+  // 查詢「新增 1 席」的費用：先以預設席數探測，再對齊實際席數 + 1。
+  async function singleSeatPreview(accessToken, workspaceId) {
+    let targetSeats = SEAT_PREVIEW_START_SEATS;
+    for (let attempt = 0; attempt < SEAT_PREVIEW_MAX_ATTEMPTS; attempt += 1) {
+      const preview = await previewSeatCost(accessToken, workspaceId, targetSeats);
+      const result = singleSeatPreviewResult(preview, targetSeats);
+      const desired = nextSeatTarget(targetSeats, result.currentSeats);
+      if (targetSeats === desired) {
+        return result;
+      }
+      targetSeats = desired;
+    }
+    throw new Error("檢測期間當前席位數連續變化，請稍後再試");
   }
 
   async function postCheckout(accessToken, payload) {
@@ -422,6 +582,164 @@
     } catch (_) {
       return "";
     }
+  }
+
+  // ===== 席位費用查詢（遷移自 DevTools 控制台腳本 time.txt）=====
+
+  function firstText(...values) {
+    for (const value of values) {
+      if (value !== undefined && value !== null && String(value).trim()) {
+        return String(value).trim();
+      }
+    }
+    return "";
+  }
+
+  // 解析 JWT 的 payload 段，取出帳號上下文；解析失敗時回傳空物件。
+  function decodeJwtClaims(token) {
+    const part = String(token || "").split(".")[1];
+    if (!part) return {};
+    try {
+      const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+      const bytes = Uint8Array.from(atob(padded), (value) => value.charCodeAt(0));
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function authContext(session) {
+    const account = session?.account && typeof session.account === "object"
+      ? session.account
+      : {};
+    const claims = decodeJwtClaims(session?.accessToken);
+    const auth = claims?.[AUTH_CLAIM] && typeof claims[AUTH_CLAIM] === "object"
+      ? claims[AUTH_CLAIM]
+      : {};
+    return {
+      accessToken: firstText(session?.accessToken, session?.access_token),
+      accountId: firstText(
+        auth.chatgpt_account_id,
+        auth.poid,
+        session?.chatgpt_account_id,
+        session?.account_id,
+        session?.workspace_id,
+        account.id,
+        account.account_id,
+      ),
+    };
+  }
+
+  // 從 accounts/check 回應整理出可用（未停用且非 personal）的 workspace 列表。
+  function workspaceRows(payload) {
+    const accounts = payload?.accounts && typeof payload.accounts === "object"
+      ? payload.accounts
+      : {};
+    const ordering = Array.isArray(payload?.account_ordering)
+      ? payload.account_ordering.map(String)
+      : Object.keys(accounts);
+    const ids = [...new Set([...ordering, ...Object.keys(accounts)])];
+    return ids
+      .map((key) => {
+        const wrapper = accounts[key] && typeof accounts[key] === "object"
+          ? accounts[key]
+          : {};
+        const account = wrapper.account && typeof wrapper.account === "object"
+          ? wrapper.account
+          : wrapper;
+        return {
+          id: firstText(account.account_id, account.id, wrapper.account_id, key),
+          name: firstText(
+            account.name,
+            account.workspace_name,
+            wrapper.name,
+            wrapper.workspace_name,
+            key,
+          ),
+          structure: firstText(account.structure, wrapper.structure).toLowerCase(),
+          deactivated: account.is_deactivated === true || wrapper.is_deactivated === true,
+        };
+      })
+      .filter((row) => row.id && !row.deactivated);
+  }
+
+  function isWorkspaceRowSelectable(row) {
+    return Boolean(row && row.structure && row.structure !== "personal");
+  }
+
+  // 席位查詢只认 Team/Business workspace；personal 帳號無席位概念。
+  function selectableWorkspaces(rows) {
+    return (Array.isArray(rows) ? rows : []).filter(isWorkspaceRowSelectable);
+  }
+
+  // 金額以 minor unit 儲存，依幣別的小數位數還原為實際數值。
+  function currencyMinorUnit(currency) {
+    if (ZERO_DECIMAL_CURRENCIES.has(currency)) return 0;
+    if (THREE_DECIMAL_CURRENCIES.has(currency)) return 3;
+    if (FOUR_DECIMAL_CURRENCIES.has(currency)) return 4;
+    return 2;
+  }
+
+  // 從費用預覽回應取金額、幣別並格式化；金額或幣別無效時擲錯。
+  function previewAmount(preview) {
+    const amountDue = preview?.amount_due && typeof preview.amount_due === "object"
+      ? preview.amount_due
+      : {};
+    const rawAmount = amountDue.amount ?? preview?.total_amount;
+    const currency = firstText(preview?.currency, amountDue.currency).toUpperCase();
+    if (rawAmount === undefined || rawAmount === null || !/^[A-Z]{3}$/.test(currency)) {
+      throw new Error("費用預覽未回傳有效的金額或幣別");
+    }
+    const minorUnit = currencyMinorUnit(currency);
+    const amount = Number(rawAmount) / 10 ** minorUnit;
+    if (!Number.isFinite(amount)) throw new Error("費用預覽金額無效");
+    let formatted;
+    try {
+      formatted = new Intl.NumberFormat("zh-TW", {
+        style: "currency",
+        currency,
+        minimumFractionDigits: minorUnit,
+        maximumFractionDigits: minorUnit,
+      }).format(amount);
+    } catch (_) {
+      formatted = `${currency} ${amount.toFixed(minorUnit)}`;
+    }
+    return { amount, currency, minorUnit, formatted };
+  }
+
+  // 帳單時間統一以台北時間顯示；無法解析時原樣回傳。
+  function billingTime(value) {
+    const raw = firstText(value);
+    if (!raw) return { formatted: "未回傳", raw: "" };
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return { formatted: raw, raw };
+    return {
+      formatted: new Intl.DateTimeFormat("zh-TW", {
+        timeZone: "Asia/Taipei",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(date),
+      raw,
+    };
+  }
+
+  // 以「當前席數 + 1」反覆校正預覽席數，避免查詢期間席數變動造成誤差。
+  function nextSeatTarget(targetSeats, currentSeats) {
+    return currentSeats + 1;
+  }
+
+  function singleSeatPreviewResult(preview, targetSeats) {
+    const currentSeats = Number(preview?.current_seat_quantity);
+    if (!Number.isInteger(currentSeats) || currentSeats < 1) {
+      throw new Error("費用預覽未回傳當前席位數");
+    }
+    return { preview, currentSeats, updatedSeats: targetSeats };
   }
 
   async function copyToClipboard(text) {
@@ -546,7 +864,7 @@
 
       .subscription-toolbox-tabs {
         display: grid;
-        grid-template-columns: 1fr 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr 1fr;
         gap: 8px;
       }
 
@@ -693,6 +1011,42 @@
         color: #b91c1c;
       }
 
+      .subscription-toolbox-result.is-rows {
+        background: #f8fafc;
+        border-color: #e2e8f0;
+        color: #0f172a;
+      }
+
+      .subscription-toolbox-result-row {
+        display: grid;
+        grid-template-columns: 96px minmax(0, 1fr);
+        gap: 10px;
+        align-items: baseline;
+        padding: 6px 0;
+        border-bottom: 1px solid #e2e8f0;
+      }
+
+      .subscription-toolbox-result-row:last-child {
+        border-bottom: 0;
+      }
+
+      .subscription-toolbox-result-label {
+        font-size: 12px;
+        color: #64748b;
+      }
+
+      .subscription-toolbox-result-value {
+        font-size: 13px;
+        font-weight: 500;
+        overflow-wrap: anywhere;
+      }
+
+      .subscription-toolbox-result-row.is-primary .subscription-toolbox-result-value {
+        font-size: 18px;
+        font-weight: 700;
+        color: #0f766e;
+      }
+
       .subscription-toolbox-result-title {
         margin: 0;
         font-size: 13px;
@@ -785,12 +1139,16 @@
   function setResult(result) {
     state.lastLink = result.link || "";
     state.lastError = result.error || "";
+    state.lastTitle = result.title || "";
+    state.lastRows = Array.isArray(result.rows) ? result.rows : [];
     renderResult();
   }
 
   function clearResult() {
     state.lastLink = "";
     state.lastError = "";
+    state.lastTitle = "";
+    state.lastRows = [];
     renderResult();
   }
 
@@ -855,6 +1213,26 @@
       actions.appendChild(openButton);
       actions.appendChild(copyButton);
       container.appendChild(actions);
+      return;
+    }
+
+    if (state.lastRows.length) {
+      // 席位查詢等非連結結果：以「標題 + 標籤／數值列」呈現。
+      container.classList.add("is-visible", "is-rows");
+      container.appendChild(
+        createElement("p", "subscription-toolbox-result-title", state.lastTitle || "查詢結果"),
+      );
+      for (const row of state.lastRows) {
+        const item = createElement("div", "subscription-toolbox-result-row");
+        item.classList.add(row.primary ? "is-primary" : "is-normal");
+        item.appendChild(
+          createElement("span", "subscription-toolbox-result-label", row.label),
+        );
+        item.appendChild(
+          createElement("span", "subscription-toolbox-result-value", row.value),
+        );
+        container.appendChild(item);
+      }
       return;
     }
 
@@ -967,6 +1345,76 @@
     } catch (error) {
       console.error("Codex 直接結帳連結產生失敗", error);
       setResult({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // 讀取 workspace 下拉選單資料；選單只列 Team/Business workspace。
+  async function loadSeatWorkspaces() {
+    state.seatForm.loadState = "loading";
+    state.seatForm.loadError = "";
+    renderBody();
+
+    try {
+      const { session, context } = await fetchSeatInitialSession();
+      const accounts = await fetchWorkspaceAccounts(context.accessToken);
+      const rows = selectableWorkspaces(workspaceRows(accounts));
+      if (!rows.length) {
+        throw new Error("目前帳號沒有可用的 Team / Business Workspace");
+      }
+
+      state.seatForm.workspaces = rows;
+      state.seatForm.selectedId = rows.some((row) => row.id === context.accountId)
+        ? context.accountId
+        : rows[0].id;
+      state.seatForm.loadState = "ready";
+    } catch (error) {
+      state.seatForm.workspaces = [];
+      state.seatForm.selectedId = "";
+      state.seatForm.loadState = "error";
+      state.seatForm.loadError = error instanceof Error ? error.message : String(error);
+    } finally {
+      renderBody();
+    }
+  }
+
+  // 席位費用查詢：切換 workspace 上下文後讀取「新增 1 席」的預覽金額。
+  async function handleSeatSubmit() {
+    clearResult();
+
+    const workspaceId = state.seatForm.selectedId;
+    if (!workspaceId) {
+      setResult({ error: "請先載入並選擇要檢測的 Workspace。" });
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const { session } = await fetchSeatInitialSession();
+      const context = await workspaceSession(workspaceId, session);
+      const result = await singleSeatPreview(context.accessToken, workspaceId);
+      const amount = previewAmount(result.preview);
+      const renewal = billingTime(result.preview?.renewal_date);
+      const workspace = state.seatForm.workspaces.find((row) => row.id === workspaceId);
+
+      setResult({
+        title: "單一席位費用",
+        rows: [
+          { label: "新增 1 席費用", value: amount.formatted, primary: true },
+          { label: "帳單時間", value: `${renewal.formatted}（台北時間）` },
+          ...(renewal.raw ? [{ label: "原始帳單時間", value: renewal.raw }] : []),
+          { label: "席位變化", value: `${result.currentSeats} → ${result.updatedSeats}` },
+          { label: "Workspace", value: `${workspace ? workspace.name : workspaceId} (${workspaceId})` },
+        ],
+      });
+    } catch (error) {
+      console.error("席位費用查詢失敗", error);
+      setResult({
+        title: "席位費用檢測失敗",
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       setLoading(false);
     }
@@ -1138,6 +1586,76 @@
     container.appendChild(directCard);
   }
 
+  function renderSeatTabContent(container) {
+    const card = createElement("div", "subscription-toolbox-card");
+    const grid = createElement("div", "subscription-toolbox-grid");
+
+    const intro = createElement("div", "subscription-toolbox-field");
+    intro.appendChild(
+      createElement(
+        "label",
+        "",
+        "查詢 Team / Business Workspace 新增 1 席的費用（唯讀，不會變更訂閱）",
+      ),
+    );
+    grid.appendChild(intro);
+
+    if (state.seatForm.loadState === "idle") {
+      const actions = createElement("div", "subscription-toolbox-actions");
+      const loadButton = createElement("button", "subscription-toolbox-primary", "載入 Workspace 列表");
+      loadButton.type = "button";
+      loadButton.addEventListener("click", loadSeatWorkspaces);
+      actions.appendChild(loadButton);
+      grid.appendChild(actions);
+    } else if (state.seatForm.loadState === "loading") {
+      grid.appendChild(
+        createElement("p", "subscription-toolbox-result-text", "載入 Workspace 列表中..."),
+      );
+    } else if (state.seatForm.loadState === "error") {
+      const hint = createElement("div", "subscription-toolbox-hint is-mismatch");
+      hint.textContent = state.seatForm.loadError;
+      grid.appendChild(hint);
+
+      const actions = createElement("div", "subscription-toolbox-actions");
+      const retryButton = createElement("button", "subscription-toolbox-primary", "重新載入");
+      retryButton.type = "button";
+      retryButton.addEventListener("click", loadSeatWorkspaces);
+      actions.appendChild(retryButton);
+      grid.appendChild(actions);
+    } else {
+      const field = createElement("div", "subscription-toolbox-field");
+      field.appendChild(createElement("label", "", "Workspace"));
+      const select = document.createElement("select");
+      for (const workspace of state.seatForm.workspaces) {
+        const option = document.createElement("option");
+        option.value = workspace.id;
+        option.textContent = `${workspace.name} (${workspace.id})`;
+        option.selected = workspace.id === state.seatForm.selectedId;
+        select.appendChild(option);
+      }
+      select.addEventListener("change", (event) => {
+        state.seatForm.selectedId = event.target.value;
+      });
+      field.appendChild(select);
+      grid.appendChild(field);
+
+      const actions = createElement("div", "subscription-toolbox-actions");
+      const button = createElement(
+        "button",
+        "subscription-toolbox-primary",
+        state.loading ? "查詢席位費用中..." : "查詢席位費用",
+      );
+      button.type = "button";
+      button.disabled = state.loading;
+      button.addEventListener("click", handleSeatSubmit);
+      actions.appendChild(button);
+      grid.appendChild(actions);
+    }
+
+    card.appendChild(grid);
+    container.appendChild(card);
+  }
+
   function renderBody() {
     const body = document.getElementById(DOM_IDS.panelBody);
     if (!body) return;
@@ -1181,9 +1699,22 @@
       renderBody();
     });
 
+    const seatTab = createElement(
+      "button",
+      `subscription-toolbox-tab${state.activeTab === "seat" ? " is-active" : ""}`,
+      "席位",
+    );
+    seatTab.id = DOM_IDS.tabSeat;
+    seatTab.type = "button";
+    seatTab.addEventListener("click", () => {
+      state.activeTab = "seat";
+      renderBody();
+    });
+
     tabs.appendChild(teamTab);
     tabs.appendChild(plusTab);
     tabs.appendChild(codexTab);
+    tabs.appendChild(seatTab);
     body.appendChild(tabs);
 
     const content = createElement("div", "subscription-toolbox-content");
@@ -1191,8 +1722,10 @@
       renderTeamTabContent(content);
     } else if (state.activeTab === "plus") {
       renderPlusTabContent(content);
-    } else {
+    } else if (state.activeTab === "codex") {
       renderCodexTabContent(content);
+    } else {
+      renderSeatTabContent(content);
     }
     body.appendChild(content);
 
@@ -1376,12 +1909,16 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
+      authContext,
+      billingTime,
       buildCodexDirectPayload,
       buildCodexUpdatePayload,
       buildCodexCheckoutLink,
       buildPlusPayload,
       buildTeamPayload,
       clampFabPosition,
+      currencyMinorUnit,
+      decodeJwtClaims,
       extractCheckoutLink,
       extractCheckoutSessionId,
       getCountryDefaultCurrency,
@@ -1391,8 +1928,13 @@
       getPlusSummaryLines,
       getSuccessMessage,
       hasFabDragExceededThreshold,
+      nextSeatTarget,
       normalizeCodexQuantity,
+      previewAmount,
+      selectableWorkspaces,
       shouldClosePanelOnDocumentClick,
+      singleSeatPreviewResult,
+      workspaceRows,
     };
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

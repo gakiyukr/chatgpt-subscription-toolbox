@@ -1,0 +1,402 @@
+/*
+ * ChatGPT Team/Business single-seat cost checker.
+ *
+ * Usage:
+ *   1. Sign in at https://chatgpt.com/ with the workspace owner account.
+ *   2. Paste this entire file into DevTools Console and run it.
+ *
+ * This script only calls the subscription preview endpoint. It never submits
+ * a seat update or changes the subscription.
+ */
+(async () => {
+  "use strict";
+
+  const CHATGPT_ORIGIN = "https://chatgpt.com";
+  const AUTH_CLAIM = "https://api.openai.com/auth";
+  const DIALOG_ID = "team-workflow-seat-cost-dialog";
+
+  const ZERO_DECIMAL_CURRENCIES = new Set([
+    "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA",
+    "PYG", "RWF", "VND", "VUV", "XAF", "XOF", "XPF",
+  ]);
+  const THREE_DECIMAL_CURRENCIES = new Set([
+    "BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND",
+  ]);
+  const FOUR_DECIMAL_CURRENCIES = new Set(["CLF", "UYW"]);
+
+  function firstText(...values) {
+    for (const value of values) {
+      if (value !== undefined && value !== null && String(value).trim()) {
+        return String(value).trim();
+      }
+    }
+    return "";
+  }
+
+  function decodeJwtClaims(token) {
+    const part = String(token || "").split(".")[1];
+    if (!part) return {};
+    try {
+      const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+      const bytes = Uint8Array.from(atob(padded), (value) => value.charCodeAt(0));
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function authContext(session) {
+    const account = session?.account && typeof session.account === "object"
+      ? session.account
+      : {};
+    const claims = decodeJwtClaims(session?.accessToken);
+    const auth = claims?.[AUTH_CLAIM] && typeof claims[AUTH_CLAIM] === "object"
+      ? claims[AUTH_CLAIM]
+      : {};
+    return {
+      accessToken: firstText(session?.accessToken, session?.access_token),
+      accountId: firstText(
+        auth.chatgpt_account_id,
+        auth.poid,
+        session?.chatgpt_account_id,
+        session?.account_id,
+        session?.workspace_id,
+        account.id,
+        account.account_id,
+      ),
+    };
+  }
+
+  function cookieValue(name) {
+    const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+
+  function setCookie(name, value) {
+    document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; Secure; SameSite=Lax`;
+  }
+
+  function clearCookie(name) {
+    document.cookie = `${name}=; Path=/; Max-Age=0; Secure; SameSite=Lax`;
+  }
+
+  async function requestJson(url, options = {}, label = "请求") {
+    const response = await fetch(url, {
+      credentials: "include",
+      cache: "no-store",
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    const text = await response.text();
+    let data = {};
+    if (text.trim()) {
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = {};
+      }
+    }
+    if (!response.ok) {
+      const error = data?.error && typeof data.error === "object" ? data.error : {};
+      const detail = firstText(
+        error.message,
+        error.code,
+        data?.message,
+        data?.detail,
+        text.slice(0, 240),
+      );
+      throw new Error(`${label}失败：HTTP ${response.status}${detail ? ` · ${detail}` : ""}`);
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error(`${label}失败：响应不是 JSON 对象`);
+    }
+    return data;
+  }
+
+  function workspaceRows(payload) {
+    const accounts = payload?.accounts && typeof payload.accounts === "object"
+      ? payload.accounts
+      : {};
+    const ordering = Array.isArray(payload?.account_ordering)
+      ? payload.account_ordering.map(String)
+      : Object.keys(accounts);
+    const ids = [...new Set([...ordering, ...Object.keys(accounts)])];
+    return ids.map((key) => {
+      const wrapper = accounts[key] && typeof accounts[key] === "object"
+        ? accounts[key]
+        : {};
+      const account = wrapper.account && typeof wrapper.account === "object"
+        ? wrapper.account
+        : wrapper;
+      return {
+        id: firstText(account.account_id, account.id, wrapper.account_id, key),
+        name: firstText(
+          account.name,
+          account.workspace_name,
+          wrapper.name,
+          wrapper.workspace_name,
+          key,
+        ),
+        structure: firstText(account.structure, wrapper.structure).toLowerCase(),
+        deactivated: account.is_deactivated === true || wrapper.is_deactivated === true,
+      };
+    }).filter((row) => row.id && !row.deactivated);
+  }
+
+  function chooseWorkspace(rows, currentId) {
+    const current = rows.find((row) => row.id === currentId);
+    if (current && current.structure && current.structure !== "personal") return current;
+
+    const workspaces = rows.filter((row) => row.structure !== "personal");
+    if (workspaces.length === 1) return workspaces[0];
+    if (!workspaces.length) {
+      throw new Error("当前账号没有可用的 Team/Business Workspace");
+    }
+
+    const options = workspaces
+      .map((row, index) => `${index + 1}. ${row.name} (${row.id})`)
+      .join("\n");
+    const answer = window.prompt(`请选择要检测的 Workspace：\n\n${options}`, "1");
+    if (answer === null) throw new Error("已取消检测");
+    const index = Number(answer) - 1;
+    if (!Number.isInteger(index) || !workspaces[index]) {
+      throw new Error("Workspace 序号无效");
+    }
+    return workspaces[index];
+  }
+
+  async function workspaceSession(workspaceId, initialSession) {
+    const initial = authContext(initialSession);
+    if (initial.accountId === workspaceId && initial.accessToken) return initial;
+
+    const query = new URLSearchParams({
+      exchange_workspace_token: "true",
+      workspace_id: workspaceId,
+      reason: "setCurrentAccount",
+    });
+    const contextCookies = [
+      ["_account", workspaceId],
+      ["_account_is_fedramp", "false"],
+      ["_account_residency_region", "no_constraint"],
+    ];
+    const previousCookies = new Map(
+      contextCookies.map(([name]) => [name, cookieValue(name)]),
+    );
+    let session;
+    try {
+      for (const [name, value] of contextCookies) setCookie(name, value);
+      session = await requestJson(
+        `/api/auth/session?${query}`,
+        {
+          headers: {
+            "X-OpenAI-Target-Path": "/api/auth/session",
+            "X-OpenAI-Target-Route": "/api/auth/session",
+          },
+        },
+        "切换 Workspace 上下文",
+      );
+    } finally {
+      for (const [name] of contextCookies) {
+        const previous = previousCookies.get(name);
+        if (previous) setCookie(name, previous);
+        else clearCookie(name);
+      }
+    }
+    const context = authContext(session);
+    if (!context.accessToken) throw new Error("Workspace 会话未返回 Access Token");
+    if (context.accountId && context.accountId !== workspaceId) {
+      throw new Error(`Workspace 切换结果不匹配：${context.accountId}`);
+    }
+    return {...context, accountId: workspaceId};
+  }
+
+  async function previewSeatCost(accessToken, workspaceId, updatedSeats) {
+    const query = new URLSearchParams({
+      account_id: workspaceId,
+      updated_seats: String(updatedSeats),
+    });
+    return requestJson(
+      `/backend-api/subscriptions/update/preview?${query}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "chatgpt-account-id": workspaceId,
+        },
+      },
+      "读取席位费用",
+    );
+  }
+
+  async function singleSeatPreview(accessToken, workspaceId) {
+    let targetSeats = 3;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const preview = await previewSeatCost(accessToken, workspaceId, targetSeats);
+      const currentSeats = Number(preview?.current_seat_quantity);
+      if (!Number.isInteger(currentSeats) || currentSeats < 1) {
+        throw new Error("费用预览未返回当前席位数");
+      }
+      const desiredSeats = currentSeats + 1;
+      if (targetSeats === desiredSeats) {
+        return {preview, currentSeats, updatedSeats: targetSeats};
+      }
+      targetSeats = desiredSeats;
+    }
+    throw new Error("检测期间当前席位数连续变化，请稍后重试");
+  }
+
+  function currencyMinorUnit(currency) {
+    if (ZERO_DECIMAL_CURRENCIES.has(currency)) return 0;
+    if (THREE_DECIMAL_CURRENCIES.has(currency)) return 3;
+    if (FOUR_DECIMAL_CURRENCIES.has(currency)) return 4;
+    return 2;
+  }
+
+  function previewAmount(preview) {
+    const amountDue = preview?.amount_due && typeof preview.amount_due === "object"
+      ? preview.amount_due
+      : {};
+    const rawAmount = amountDue.amount ?? preview?.total_amount;
+    const currency = firstText(preview?.currency, amountDue.currency).toUpperCase();
+    if (rawAmount === undefined || rawAmount === null || !/^[A-Z]{3}$/.test(currency)) {
+      throw new Error("费用预览未返回有效的金额或币种");
+    }
+    const minorUnit = currencyMinorUnit(currency);
+    const amount = Number(rawAmount) / 10 ** minorUnit;
+    if (!Number.isFinite(amount)) throw new Error("费用预览金额无效");
+    let formatted;
+    try {
+      formatted = new Intl.NumberFormat("zh-CN", {
+        style: "currency",
+        currency,
+        minimumFractionDigits: minorUnit,
+        maximumFractionDigits: minorUnit,
+      }).format(amount);
+    } catch (_) {
+      formatted = `${currency} ${amount.toFixed(minorUnit)}`;
+    }
+    return {amount, currency, minorUnit, formatted};
+  }
+
+  function billingTime(value) {
+    const raw = firstText(value);
+    if (!raw) return {formatted: "未返回", raw: ""};
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return {formatted: raw, raw};
+    return {
+      formatted: new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(date),
+      raw,
+    };
+  }
+
+  function showDialog({title, tone = "normal", rows}) {
+    document.getElementById(DIALOG_ID)?.remove();
+    const dialog = document.createElement("dialog");
+    dialog.id = DIALOG_ID;
+    dialog.style.cssText = [
+      "width:min(460px,calc(100% - 40px))", "max-width:460px", "padding:0",
+      "border:0", "border-radius:8px", "background:transparent", "overflow:visible",
+      "z-index:2147483647",
+      "font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+    ].join(";");
+    const panel = document.createElement("section");
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.style.cssText = [
+      "width:min(460px,100%)", "background:#fff", "color:#171717",
+      "border:1px solid #d8d8d8", "border-radius:8px",
+      "box-shadow:0 24px 70px rgba(0,0,0,.32)", "overflow:hidden",
+    ].join(";");
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    heading.style.cssText = [
+      "margin:0", "padding:18px 20px", "font-size:18px", "line-height:1.35",
+      `border-top:4px solid ${tone === "error" ? "#c83b3b" : "#16845b"}`,
+      "border-bottom:1px solid #e6e6e6",
+    ].join(";");
+    const list = document.createElement("dl");
+    list.style.cssText = "margin:0;padding:8px 20px 4px";
+    for (const row of rows) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "display:grid;grid-template-columns:120px minmax(0,1fr);gap:12px;padding:10px 0;border-bottom:1px solid #eee";
+      const label = document.createElement("dt");
+      label.textContent = row.label;
+      label.style.cssText = "color:#666;font-size:13px";
+      const value = document.createElement("dd");
+      value.textContent = row.value;
+      value.style.cssText = `margin:0;font-size:${row.primary ? "20px" : "14px"};font-weight:${row.primary ? "700" : "500"};overflow-wrap:anywhere`;
+      wrap.append(label, value);
+      list.append(wrap);
+    }
+    const footer = document.createElement("footer");
+    footer.style.cssText = "display:flex;justify-content:flex-end;padding:14px 20px";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "关闭";
+    close.style.cssText = "border:1px solid #bbb;border-radius:6px;background:#fff;color:#171717;padding:8px 18px;font:inherit;cursor:pointer";
+    close.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+    dialog.addEventListener("close", () => dialog.remove(), {once: true});
+    footer.append(close);
+    panel.append(heading, list, footer);
+    dialog.append(panel);
+    document.body.append(dialog);
+    dialog.showModal();
+    close.focus();
+  }
+
+  try {
+    if (window.location.origin !== CHATGPT_ORIGIN) {
+      throw new Error("请在 https://chatgpt.com/ 页面运行此脚本");
+    }
+    const initialSession = await requestJson("/api/auth/session", {}, "读取登录会话");
+    const initialContext = authContext(initialSession);
+    if (!initialContext.accessToken) throw new Error("当前页面没有有效登录会话");
+
+    const accounts = await requestJson(
+      "/backend-api/accounts/check/v4-2023-04-27",
+      {headers: {Authorization: `Bearer ${initialContext.accessToken}`}},
+      "读取 Workspace 列表",
+    );
+    const workspace = chooseWorkspace(workspaceRows(accounts), initialContext.accountId);
+    const context = await workspaceSession(workspace.id, initialSession);
+    const result = await singleSeatPreview(context.accessToken, workspace.id);
+    const amount = previewAmount(result.preview);
+    const renewal = billingTime(result.preview?.renewal_date);
+
+    showDialog({
+      title: "单个席位费用",
+      rows: [
+        {label: "新增 1 席费用", value: amount.formatted, primary: true},
+        {label: "账单时间", value: `${renewal.formatted}（北京时间）`},
+        ...(renewal.raw ? [{label: "原始账单时间", value: renewal.raw}] : []),
+        {label: "席位变化", value: `${result.currentSeats} → ${result.updatedSeats}`},
+        {label: "Workspace", value: `${workspace.name} (${workspace.id})`},
+      ],
+    });
+  } catch (error) {
+    showDialog({
+      title: "席位费用检测失败",
+      tone: "error",
+      rows: [
+        {label: "错误", value: firstText(error?.message, error)},
+      ],
+    });
+    console.error("[seat-cost-check]", error);
+  }
+})();

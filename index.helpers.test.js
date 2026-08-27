@@ -18,6 +18,15 @@ const {
   getSuccessMessage,
   normalizeCodexQuantity,
   shouldClosePanelOnDocumentClick,
+  authContext,
+  billingTime,
+  currencyMinorUnit,
+  decodeJwtClaims,
+  nextSeatTarget,
+  previewAmount,
+  selectableWorkspaces,
+  singleSeatPreviewResult,
+  workspaceRows,
 } = require("./index.js");
 
 test("team payload preserves seat count, billing, and promo code", () => {
@@ -251,4 +260,132 @@ test("buildCodexCheckoutLink prefers a direct link, else rebuilds from session i
     "https://chatgpt.com/checkout/openai_llc/cs_rebuild_1?kind=codex_team",
   );
   assert.equal(buildCodexCheckoutLink({}, ""), null);
+});
+
+// ===== 席位費用查詢（遷移自 time.txt）=====
+
+// 以 header.payload.signature 結構造一個可解析的假 JWT。
+function makeJwt(claims) {
+  const encode = (value) =>
+    Buffer.from(JSON.stringify(value), "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  return `${encode({ alg: "none" })}.${encode(claims)}.signature`;
+}
+
+test("decodeJwtClaims parses base64url payload and tolerates invalid tokens", () => {
+  const claims = decodeJwtClaims(makeJwt({ "https://api.openai.com/auth": { poid: "ws_1" } }));
+  assert.equal(claims["https://api.openai.com/auth"].poid, "ws_1");
+  assert.deepEqual(decodeJwtClaims("not-a-jwt"), {});
+  assert.deepEqual(decodeJwtClaims(""), {});
+});
+
+test("authContext prefers jwt claim account id and falls back through session fields", () => {
+  const token = makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "ws_claim" } });
+  const context = authContext({ accessToken: token });
+  assert.equal(context.accessToken, token);
+  assert.equal(context.accountId, "ws_claim");
+
+  const fallback = authContext({ accessToken: makeJwt({}), workspace_id: "ws_session" });
+  assert.equal(fallback.accountId, "ws_session");
+
+  assert.deepEqual(authContext({}), { accessToken: "", accountId: "" });
+});
+
+test("workspaceRows flattens accounts map and filters deactivated rows", () => {
+  const rows = workspaceRows({
+    account_ordering: ["ws_a", "ws_b", "ws_c"],
+    accounts: {
+      ws_a: { account: { account_id: "ws_a", name: "Alpha", structure: "workspace" } },
+      ws_b: { account: { account_id: "ws_b", name: "Beta", structure: "personal" } },
+      ws_c: { account: { account_id: "ws_c", name: "Gamma", structure: "workspace", is_deactivated: true } },
+    },
+  });
+
+  // 停用帳號在此階段即被過濾，personal 帳號留給 selectableWorkspaces 處理。
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    ["ws_a", "ws_b"],
+  );
+  assert.equal(rows[0].name, "Alpha");
+  assert.equal(rows[1].structure, "personal");
+});
+
+test("workspaceRows falls back to wrapper fields and key when account fields are missing", () => {
+  const rows = workspaceRows({
+    accounts: {
+      key_only: {},
+      wrapper_named: { account_id: "ws_w", workspace_name: "Wrapper" },
+    },
+  });
+
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  assert.equal(byId.get("key_only").name, "key_only");
+  assert.equal(byId.get("ws_w").name, "Wrapper");
+});
+
+test("selectableWorkspaces keeps only non-personal rows", () => {
+  const rows = [
+    { id: "ws_personal", name: "Personal", structure: "personal" },
+    { id: "ws_team", name: "Team", structure: "workspace" },
+    { id: "ws_blank", name: "Blank", structure: "" },
+  ];
+
+  assert.deepEqual(selectableWorkspaces(rows), [rows[1]]);
+  assert.deepEqual(selectableWorkspaces(undefined), []);
+});
+
+test("currencyMinorUnit maps exceptional currencies to their decimal digits", () => {
+  assert.equal(currencyMinorUnit("JPY"), 0);
+  assert.equal(currencyMinorUnit("KRW"), 0);
+  assert.equal(currencyMinorUnit("BHD"), 3);
+  assert.equal(currencyMinorUnit("CLF"), 4);
+  assert.equal(currencyMinorUnit("USD"), 2);
+  assert.equal(currencyMinorUnit("EUR"), 2);
+});
+
+test("previewAmount divides minor units and formats by currency", () => {
+  const usd = previewAmount({ amount_due: { amount: 2500, currency: "usd" } });
+  assert.equal(usd.amount, 25);
+  assert.equal(usd.minorUnit, 2);
+  assert.equal(usd.currency, "USD");
+  // 格式化字元依環境 locale 資料而異，只斷言數值部分。
+  assert.equal(usd.formatted.includes("25.00"), true);
+
+  const jpy = previewAmount({ total_amount: 3000, currency: "JPY" });
+  assert.equal(jpy.amount, 3000);
+  assert.equal(jpy.minorUnit, 0);
+  assert.equal(jpy.formatted.includes("3,000"), true);
+});
+
+test("previewAmount throws when amount or currency is missing or invalid", () => {
+  assert.throws(() => previewAmount({}), /金額或幣別/);
+  assert.throws(() => previewAmount({ amount_due: { amount: 100, currency: "US" } }), /金額或幣別/);
+  assert.throws(() => previewAmount({ amount_due: { amount: "x", currency: "USD" } }), /金額無效/);
+});
+
+test("billingTime formats to Taipei time and handles empty or raw values", () => {
+  const taipei = billingTime("2026-08-27T00:00:00Z");
+  assert.equal(taipei.raw, "2026-08-27T00:00:00Z");
+  // UTC 00:00 為台北時間 08:00；分隔字元依環境而異，僅斷言日期與時間段。
+  assert.equal(taipei.formatted.startsWith("2026/08/27"), true);
+  assert.equal(taipei.formatted.includes("08:00:00"), true);
+
+  assert.deepEqual(billingTime(""), { formatted: "未回傳", raw: "" });
+  assert.deepEqual(billingTime("not-a-date"), { formatted: "not-a-date", raw: "not-a-date" });
+});
+
+test("nextSeatTarget always aims one seat above the current count", () => {
+  assert.equal(nextSeatTarget(3, 2), 3);
+  assert.equal(nextSeatTarget(3, 10), 11);
+});
+
+test("singleSeatPreviewResult validates current seat quantity from preview", () => {
+  const result = singleSeatPreviewResult({ current_seat_quantity: 2 }, 3);
+  assert.deepEqual(result, { preview: { current_seat_quantity: 2 }, currentSeats: 2, updatedSeats: 3 });
+
+  assert.throws(() => singleSeatPreviewResult({}, 3), /當前席位數/);
+  assert.throws(() => singleSeatPreviewResult({ current_seat_quantity: 0 }, 3), /當前席位數/);
 });
