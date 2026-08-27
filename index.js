@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 訂閱工具箱
 // @namespace    local.chatgpt.subscription.toolbox
-// @version      1.2.0
+// @version      1.2.1
 // @description  整合 ChatGPT Team、Plus 與 Codex 的結帳連結與席位費用查詢工具。
 // @downloadURL  https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
 // @updateURL    https://cdn.jsdelivr.net/gh/gakiyukr/chatgpt-subscription-toolbox@main/index.js
@@ -131,7 +131,8 @@
   ];
 
   const state = {
-    activeTab: "team",
+    // Team / Plus 分頁暫時停用，預設落在仍開放的 Codex 分頁。
+    activeTab: "codex",
     loading: false,
     lastLink: "",
     lastError: "",
@@ -864,7 +865,7 @@
 
       .subscription-toolbox-tabs {
         display: grid;
-        grid-template-columns: 1fr 1fr 1fr 1fr;
+        grid-template-columns: 1fr 1fr;
         gap: 8px;
       }
 
@@ -1711,10 +1712,11 @@
       renderBody();
     });
 
-    tabs.appendChild(teamTab);
-    tabs.appendChild(plusTab);
     tabs.appendChild(codexTab);
     tabs.appendChild(seatTab);
+    // 舊 Team 提長鏈 / Plus 免費試用與選地區提長鏈暫時下架，僅保留程式碼。
+    // tabs.appendChild(teamTab);
+    // tabs.appendChild(plusTab);
     body.appendChild(tabs);
 
     const content = createElement("div", "subscription-toolbox-content");
